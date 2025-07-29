@@ -1,88 +1,106 @@
-// Import required modules
-require('dotenv').config(); // Load environment variables from .env file
+// --- 导入所需模块 ---
+require('dotenv').config(); // 加载 .env 文件中的环境变量
 const express = require('express');
 const multer = require('multer');
 const axios = require('axios');
 const FormData = require('form-data');
 const cors = require('cors');
 
-// --- Server Configuration ---
+// --- 服务器配置 ---
 const app = express();
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 8080; // Zeabur 通常使用 8080 端口
 
-// --- Middleware ---
-// Enable Cross-Origin Resource Sharing (CORS) for all routes
-app.use(cors()); 
-// Use multer for handling multipart/form-data (file uploads)
-// We'll store the file in memory temporarily.
-const storage = multer.memoryStorage();
+// --- 中间件配置 ---
+app.use(cors()); // 启用CORS，允许小程序跨域访问
+const storage = multer.memoryStorage(); // 将上传的文件暂存在内存中
 const upload = multer({ storage: storage });
 
-// --- Dify API Configuration ---
-// Get Dify credentials and URL from environment variables
+// --- 从环境变量中获取Dify的关键信息 ---
 const DIFY_API_KEY = process.env.DIFY_API_KEY;
-const DIFY_FILE_UPLOAD_URL = `${process.env.DIFY_API_URL}/files/upload`;
+const DIFY_BASE_URL = process.env.DIFY_API_URL; // 我们现在把它理解为基础URL: https://api.dify.ai/v1
 
-// --- API Route ---
-/**
- * @route   POST /api/analyzeFace
- * @desc    Receives an image from the client, forwards it to Dify for analysis,
- *          and returns the analysis result.
- * @access  Public
- */
+// --- 这是我们从Dify日志中找到的、固定不变的工作流ID！---
+const WORKFLOW_ID = '80b2b6f4-926e-4927-8297-535a82af7b2e'; // 请确保这个ID是您自己的
+
+// --- API 路由: /api/analyzeFace ---
 app.post('/api/analyzeFace', upload.single('file'), async (req, res) => {
-  // 1. Check if the API key is configured
-  if (!DIFY_API_KEY) {
-    console.error('Dify API key is not configured.');
-    return res.status(500).json({ error: 'Server configuration error.' });
+  console.log('Received a new request to /api/analyzeFace');
+
+  // 1. 检查配置是否齐全
+  if (!DIFY_API_KEY || !DIFY_BASE_URL || !WORKFLOW_ID) {
+    console.error('Server configuration error: API Key, Base URL, or Workflow ID is missing.');
+    return res.status(500).json({ error: '服务器配置错误' });
   }
 
-  // 2. Check if a file was uploaded
+  // 2. 检查文件是否上传
   if (!req.file) {
-    return res.status(400).json({ error: 'No file uploaded.' });
+    console.error('No file uploaded in the request.');
+    return res.status(400).json({ error: '没有上传文件' });
   }
 
   try {
-    // 3. Prepare the data to be sent to Dify
-    const formData = new FormData();
-    // The 'file' field must match the name Dify's API expects.
-    formData.append('file', req.file.buffer, {
-      filename: req.file.originalname,
-      contentType: req.file.mimetype,
-    });
-    // Add any other required form fields, like the user ID.
-    formData.append('user', 'wechat-miniprogram-user'); // Example user ID
+    // =================================================================
+    // 步骤一：将小程序传来的图片，上传到Dify的文件服务器
+    // =================================================================
+    console.log('Step 1: Uploading file to Dify...');
+    const fileUploadFormData = new FormData();
+    fileUploadFormData.append('file', req.file.buffer, req.file.originalname);
+    fileUploadFormData.append('user', 'wechat-miniprogram-user'); // 定义一个用户标识
 
-    // 4. Make the request to Dify's file upload API
-    console.log('Forwarding file to Dify...');
-    const difyResponse = await axios.post(DIFY_FILE_UPLOAD_URL, formData, {
-      headers: {
-        ...formData.getHeaders(),
-        'Authorization': `Bearer ${DIFY_API_KEY}`,
+    const fileUploadResponse = await axios.post(
+      `${DIFY_BASE_URL}/files/upload`, // 拼接成上传文件的URL
+      fileUploadFormData,
+      {
+        headers: {
+          ...fileUploadFormData.getHeaders(),
+          'Authorization': `Bearer ${DIFY_API_KEY}`,
+        },
+      }
+    );
+    const uploadedFileId = fileUploadResponse.data.id;
+    console.log(`File uploaded successfully. File ID: ${uploadedFileId}`);
+
+    // =================================================================
+    // 步骤二：带着上传后的文件ID，去执行我们指定的工作流
+    // =================================================================
+    console.log(`Step 2: Executing workflow ${WORKFLOW_ID} with the uploaded file...`);
+    const workflowExecutionResponse = await axios.post(
+      `${DIFY_BASE_URL}/workflows/${WORKFLOW_ID}/run`, // 拼接成执行特定工作流的URL
+      {
+        inputs: {
+          "shuru": { // "shuru" 必须和您在Dify“开始”节点定义的变量名完全一致！
+            "upload_file_id": uploadedFileId,
+            "type": "image",
+            "transfer_method": "remote_url"
+          }
+        },
+        response_mode: 'blocking', // 使用阻塞模式，直接等待AI返回完整结果
+        user: 'wechat-miniprogram-user',
       },
-    });
-
-    // 5. Log Dify's response and send it back to the client
-    console.log('Received response from Dify:', difyResponse.data);
+      {
+        headers: {
+          'Authorization': `Bearer ${DIFY_API_KEY}`,
+          'Content-Type': 'application/json',
+        },
+      }
+    );
     
-    // NOTE: This example assumes you want to run a workflow after uploading.
-    // You would take the `id` from `difyResponse.data` and make another
-    // request to the workflow execution endpoint here.
-    // For simplicity, we'll return the file upload confirmation directly.
-    
-    res.status(200).json(difyResponse.data);
+    // 成功！将Dify工作流返回的最终结果，发送回小程序
+    console.log('Workflow executed successfully. Returning result to client.');
+    res.status(200).json(workflowExecutionResponse.data);
 
   } catch (error) {
-    console.error('Error forwarding request to Dify:', error.response ? error.response.data : error.message);
+    // 如果过程中任何一步出错，打印详细错误并返回错误信息
+    console.error('An error occurred during the Dify process:', error.response ? JSON.stringify(error.response.data) : error.message);
     res.status(error.response ? error.response.status : 500).json({
-      error: 'Failed to analyze the image.',
-      details: error.response ? error.response.data : 'An unknown error occurred.',
+      error: '调用AI服务失败',
+      details: error.response ? error.response.data : '未知服务器错误',
     });
   }
 });
 
-// --- Start the Server ---
+// --- 启动服务器 ---
 app.listen(PORT, () => {
-  console.log(`Server is running on http://localhost:${PORT}`);
-  console.log('Ready to receive requests at /api/analyzeFace');
-}); 
+  console.log(`Server is running and listening on port ${PORT}`);
+  console.log(`Ready to receive requests at /api/analyzeFace`);
+});
